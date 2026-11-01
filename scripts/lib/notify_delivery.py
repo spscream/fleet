@@ -240,7 +240,25 @@ def composer_empty(sid: str) -> bool:
     if (before == ["›"] and after.rstrip() == "Ask Codex to do anything"
             and len(tail) == 1 and " · " in tail[0]):
         return True
+    if (before == ["›"] and after.rstrip() == "Ask Codex to do anything"
+            and len(tail) == 2 and " · " in tail[0]
+            and _CODEX_HINT.fullmatch(tail[1])):
+        # Newer Codex draws a second footer row. Require the placeholder's
+        # faint style as well as an unchanged capture, so typed text at the
+        # start of a draft cannot pass as this newly supported layout.
+        styled = _capture(sid, "--ansi")
+        styled_lines = str(styled.get("output") or "").split("\n")
+        return ((styled.get("cursor_row"), styled.get("cursor_col")) == (row, col)
+                and [_ESCAPE.sub("", line).rstrip() for line in styled_lines]
+                == [line.rstrip() for line in lines]
+                and _all_faint_from(styled_lines[row], col))
     return len(before) == 1 and len(before[0]) <= 2 and not any(c.isalnum() for c in before[0]) and not after.strip()
+
+
+_CODEX_HINT = re.compile(
+    r'(?:New activity · Earlier messages available\.  enter/esc latest · )?'
+    r'\? shortcuts(?:\s+⚠ \d+ warnings? · f2 to view)?|\? for shortcuts'
+)
 
 
 def _capture(sid: str, *extra: str) -> dict:

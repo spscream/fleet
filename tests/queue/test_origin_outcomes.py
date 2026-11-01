@@ -189,3 +189,66 @@ def test_attach_never_reopens_a_concluded_task(queue_dir, stubs):
     ok(q("collect"))
     assert state(queue_dir, ref) == "landed"
     assert len(told(stubs)) == 2, "the origin was told again"
+
+
+# Synthetic rows preserve the observed visible-pane geometry, not transcript
+# contents: prompt at row 35, cursor column 2, two footer rows, width 154.
+def codex_wake_pane(stubs, *, draft=False, below="", hint=None, mismatch=False, cursor=2):
+    prompt = "› Ask Codex to do anything"
+    hint = hint if hint is not None else (
+        "New activity · Earlier messages available.  enter/esc latest · ? shortcuts"
+        + " " * 12 + "⚠ 2 warnings · f2 to view"
+    )
+    rows = [""] * 35 + [prompt, below,
+                            "model · ~/example · Context 50% used · Ready", hint, ""]
+    plain = {"output": "\n".join(row.ljust(154) for row in rows),
+             "cursor_row": 35, "cursor_col": cursor}
+    styled_rows = rows.copy()
+    styled_rows[35] = "› " + ("" if draft else "\x1b[2m") + prompt[2:] + "\x1b[0m"
+    if mismatch:
+        styled_rows[36] = "a draft appeared between captures"
+    styled = {**plain, "output": "\n".join(row.ljust(154) for row in styled_rows)}
+    for suffix, pane in (("", plain), (".ansi", styled)):
+        write(stubs.root / f"panes/{SID}{suffix}.json", json.dumps(pane))
+
+
+def test_codex_two_footer_rows_wake_the_exact_pending_outcome(queue_dir, stubs):
+    runtime()
+    listed(stubs)
+    ref = shipped(queue_dir, stubs, "codex-footer", 91)
+    codex_wake_pane(stubs)
+    ok(q("collect"))
+    inbox = stubs.inbox(SID)
+    assert len(inbox) == 1
+    assert inbox[0]["to_session_id"] == SID
+    expect(inbox[0]["body"], ref, "[fleet-notice:")
+    assert len(told(stubs)) == 1
+    expect(told(stubs)[0], "message inbox --claim --limit 1 --json")
+    assert ref not in told(stubs)[0], "the wake must not inject the outcome payload"
+    # Keyboard success is not an acknowledgement, and never re-enqueues.
+    assert inbox[0]["read_at"] is None
+    ok(q("collect"))
+    assert stubs.inbox(SID) == inbox
+
+
+def test_codex_two_footer_rows_refuse_drafts_busy_and_unknown_layouts(queue_dir, stubs):
+    runtime()
+    listed(stubs)
+    shipped(queue_dir, stubs, "codex-held", 92)
+    cases = [
+        {"draft": True},  # same placeholder words, typed, cursor at the start
+        {"below": "a second line of a real draft"},
+        {"hint": "unknown footer · more text"},
+        {"mismatch": True},
+        {"cursor": 3},
+        {"cursor": None},
+    ]
+    for pane in cases:
+        codex_wake_pane(stubs, **pane)
+        ok(q("collect"))
+        assert not told(stubs), pane
+    listed(stubs, state="working")
+    codex_wake_pane(stubs)
+    ok(q("collect"))
+    assert not told(stubs)
+    assert len(stubs.inbox(SID)) == 1, "refusal must preserve the exact pending receipt"
