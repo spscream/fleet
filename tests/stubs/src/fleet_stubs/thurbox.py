@@ -132,6 +132,7 @@ def mailbox(root, args: list) -> int:
         shown = rows if "--all" in args and "--claim" not in args else [
             r for r in rows if r["read_at"] is None
         ]
+        shown = shown[:int(flag(args, "--limit") or 100)]
         if "--claim" in args:
             for r in shown:
                 r["read_at"] = 1

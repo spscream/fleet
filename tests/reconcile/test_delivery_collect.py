@@ -300,3 +300,89 @@ def test_two_routes_to_same_session_share_delivery_order(stubs):
     collect()
     assert read_memory()["sent"] == [first]
     assert len(inbox(stubs)) == 2
+
+
+def backlog(stubs, count):
+    """Claimed history must still count toward the CLI's oldest-first limit."""
+    rows = [{"id": i + 1, "to_session_id": SID, "kind": "reply",
+             "body": f"older message {i}", "read_at": 1} for i in range(count)]
+    write(stubs.root / "inbox" / f"{SID}.jsonl",
+          "".join(json.dumps(row) + "\n" for row in rows))
+
+
+def delivery_route(stubs, tmp_path, route):
+    from test_notify_origin import asks, notify
+    session(stubs, "origin", "Recipient", SID, state="working")
+    if route == "outcome":
+        key = seed(stubs)
+        return collect, lambda: read_memory()["pending"].get(key), lambda: key in read_memory()["sent"]
+    ref = task("question", f"thurbox:{SID}")
+
+    def entry():
+        return json.loads((tmp_path / "origin_questions.json").read_text(encoding="utf-8"))["asked"][ref]
+
+    return lambda: notify(tmp_path, asking=asks(ref)), entry, lambda: entry().get("done", False)
+
+
+@pytest.mark.parametrize("route", ["outcome", "question"])
+@pytest.mark.parametrize("claimed", [False, True])
+def test_receipt_beyond_default_page_through_notifier(stubs, tmp_path, route, claimed):
+    backlog(stubs, 110)
+    tick, entry, done = delivery_route(stubs, tmp_path, route)
+    tick()
+    assert entry()["message_id"] == 111
+    assert len(inbox(stubs)) == 111
+    if claimed:
+        claim()
+    session(stubs, "origin", "Recipient", SID)
+    tick()
+    assert done() is claimed
+    if claimed:
+        assert wakes(stubs) == []
+    else:
+        assert len(wakes(stubs)) == 1
+        assert "message inbox --claim --limit 1 --json" in wakes(stubs)[0]
+        assert inbox(stubs)[-1]["body"] not in wakes(stubs)[0]
+        claim()
+        tick()
+        assert done()
+    assert len(stubs.calls("thurbox-cli", "message send")) == 1
+
+
+@pytest.mark.parametrize("route", ["outcome", "question"])
+@pytest.mark.parametrize("answer", ["saturated", "failure", "bad json", "duplicate", "foreign"])
+def test_incomplete_or_untrusted_snapshot_keeps_both_routes_pending(stubs, tmp_path, route, answer):
+    backlog(stubs, 110)
+    tick, entry, done = delivery_route(stubs, tmp_path, route)
+    tick()
+    before = dict(entry())
+    row = {**inbox(stubs)[-1], "read_at": 1}
+    if answer == "saturated":
+        # The expected identity is present, but unseen rows could duplicate it.
+        rows = [row] + inbox(stubs)[:1] * 4095
+        answer = json.dumps(rows)
+    elif answer == "duplicate":
+        answer = json.dumps([row, row])
+    elif answer == "foreign":
+        answer = json.dumps([{**row, "to_session_id": "foreign-recipient"}])
+    write(stubs.root / "inbox-answer", answer)
+    session(stubs, "origin", "Recipient", SID)
+    tick()
+    assert not done()
+    assert entry() == before
+    assert wakes(stubs) == []
+    assert len(stubs.calls("thurbox-cli", "message send")) == 1
+
+
+@pytest.mark.parametrize("route", ["outcome", "question"])
+def test_unknown_enqueue_beyond_default_page_recovers_without_repeat(stubs, tmp_path, route):
+    backlog(stubs, 110)
+    tick, entry, done = delivery_route(stubs, tmp_path, route)
+    write(stubs.root / "enqueue-fail-after-write", "1")
+    tick()
+    assert entry()["message_id"] == 111
+    claim()
+    tick()
+    assert done()
+    assert wakes(stubs) == []
+    assert len(stubs.calls("thurbox-cli", "message send")) == 1

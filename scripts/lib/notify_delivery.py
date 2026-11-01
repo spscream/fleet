@@ -352,10 +352,17 @@ def wake(sid: str, text: str) -> tuple[bool, str]:
 
 
 def mailbox(sid: str) -> tuple[list | None, str]:
-    """Peek including claimed records; absence is not an acknowledgement."""
+    """Peek a complete, bounded snapshot, including claimed records.
+
+    The CLI returns the oldest records and has no pagination. A full page
+    cannot prove uniqueness (even when the expected id is present), so leave
+    delivery pending at the cap. Absence is never an acknowledgement.
+    """
+    limit = 4096
     try:
         out = subprocess.run(
-            ["thurbox-cli", "message", "inbox", "--for", sid, "--all", "--json"],
+            ["thurbox-cli", "message", "inbox", "--for", sid, "--all", "--json",
+             "--limit", str(limit)],
             capture_output=True, text=True, encoding="utf-8", timeout=20,
         )
         rows = json.loads(out.stdout) if out.returncode == 0 else None
@@ -363,6 +370,8 @@ def mailbox(sid: str) -> tuple[list | None, str]:
         return None, f"inbox lookup failed: {exc}"
     if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
         return None, "inbox lookup did not answer a list of records"
+    if len(rows) >= limit:
+        return None, f"inbox lookup incomplete: reached {limit} records; retained for reconciliation"
     return rows, ""
 
 
