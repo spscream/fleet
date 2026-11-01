@@ -19,7 +19,7 @@ from pathlib import Path
 import yaml
 from queuekit import ok, result
 
-from harness import expect, run_queue as q, write
+from harness import expect, run, run_queue as q, write
 
 SID = "5b0c7d2e-0000-4000-8000-0000000000aa"
 PR = "https://github.com/Thurbeen/thurbox/pull/"
@@ -51,6 +51,11 @@ def told(stubs, sid: str = SID) -> list[str]:
     return [c for c in stubs.calls("thurbox-cli", "session send") if c.split()[3] == sid]
 
 
+def claim():
+    """The recipient follows the wake instruction; typing alone is not delivery."""
+    assert run(["thurbox-cli", "message", "inbox", "--for", SID, "--claim", "--json"]).code == 0
+
+
 def state(queue_dir: Path, ref: str) -> str:
     return yaml.safe_load((queue_dir / ref / "task.yaml").read_text(encoding="utf-8"))["state"]
 
@@ -61,7 +66,8 @@ def test_shipped_then_landed_are_each_told_once(queue_dir, stubs):
     ref = shipped(queue_dir, stubs, "one", 41)
     out = ok(q("collect")).out
     assert len(told(stubs)) == 1, out
-    expect(told(stubs)[0], f"fleet: {ref} shipped", "Fix one", f"{PR}41")
+    expect(stubs.inbox(SID)[0]["body"], f"fleet: {ref} shipped", "Fix one", f"{PR}41")
+    claim()
 
     ok(q("collect"))
     assert len(told(stubs)) == 1, "shipped was told again on a pass that moved nothing"
@@ -70,7 +76,8 @@ def test_shipped_then_landed_are_each_told_once(queue_dir, stubs):
     ok(q("collect"))
     assert state(queue_dir, ref) == "landed"
     assert len(told(stubs)) == 2
-    expect(told(stubs)[1], f"fleet: {ref} landed", f"{PR}41")
+    expect(stubs.inbox(SID)[1]["body"], f"fleet: {ref} landed", f"{PR}41")
+    claim()
     ok(q("reap"))
     ok(q("collect"))
     assert len(told(stubs)) == 2, "landed was told twice"
@@ -81,10 +88,11 @@ def test_abandoned_carries_the_why(queue_dir, stubs):
     listed(stubs)
     ref = shipped(queue_dir, stubs, "two", 42)
     ok(q("collect"))
+    claim()
     stubs.pr_state(42, "CLOSED")
     ok(q("collect"))
     assert state(queue_dir, ref) == "abandoned"
-    expect(told(stubs)[-1], f"fleet: {ref} abandoned", "closed unmerged", "closed without merging")
+    expect(stubs.inbox(SID)[-1]["body"], f"fleet: {ref} abandoned", "closed unmerged", "closed without merging")
 
 
 def test_an_origin_mid_turn_is_posted_once_and_woken_at_rest(queue_dir, stubs):
@@ -98,7 +106,8 @@ def test_an_origin_mid_turn_is_posted_once_and_woken_at_rest(queue_dir, stubs):
     listed(stubs)
     ok(q("collect"))
     assert len(told(stubs)) == 1, "the waiting outcome was not retried at rest"
-    expect(told(stubs)[0], f"{ref} shipped")
+    expect(stubs.inbox(SID)[0]["body"], f"{ref} shipped")
+    expect(told(stubs)[0], "message inbox --claim")
 
 
 def test_a_gone_session_origin_is_told_nothing_and_the_log_says_why(queue_dir, stubs):
@@ -156,6 +165,7 @@ def test_attach_never_reopens_a_concluded_task(queue_dir, stubs):
     ref = shipped(queue_dir, stubs, "seven", 48)
     ok(q("collect"))
     assert state(queue_dir, ref) == "done"
+    claim()
 
     fixer = "5b0c7d2e-0000-4000-8000-0000000000bb"
     expect(ok(q("attach", ref, fixer)).out, "kept done")
@@ -166,6 +176,7 @@ def test_attach_never_reopens_a_concluded_task(queue_dir, stubs):
 
     stubs.pr_state(48, "MERGED")
     ok(q("collect"))
+    claim()
     ok(q("reap"))
     assert state(queue_dir, ref) == "landed"
     record = (queue_dir / ref / "task.yaml").read_text(encoding="utf-8")

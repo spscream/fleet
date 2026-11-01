@@ -100,12 +100,15 @@ def mailbox(root, args: list) -> int:
         return 2
     verb = args[0] if args else ""
     if verb == "send":
+        if (root / "enqueue-fail-before-write").exists():
+            return 1
         to = flag(args, "--to")
         box = root / "inbox" / f"{to}.jsonl"
         box.parent.mkdir(parents=True, exist_ok=True)
         rows = [json.loads(line) for line in read(box).splitlines() if line]
         row = {
             "id": len(rows) + 1,
+            "to_session_id": to,
             "kind": flag(args, "--kind"),
             "body": flag(args, "--body"),
             "woke": "--no-wake" not in args,
@@ -113,9 +116,17 @@ def mailbox(root, args: list) -> int:
         }
         with open(box, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(json.dumps(row) + "\n")
+        if (root / "enqueue-fail-after-write").exists():
+            return 1
         via = "mailbox" if "--no-wake" in args else "claude-socket"
-        print(json.dumps({"enqueued": True, "message_id": row["id"], "delivered_via": via}))
+        print(json.dumps({"enqueued": True, "message_id": row["id"], "to_session_id": to, "delivered_via": via}))
     elif verb == "inbox":
+        if (root / "inbox-answer").exists():
+            answer = read(root / "inbox-answer")
+            if answer == "failure":
+                return 1
+            print(answer)
+            return 0
         box = root / "inbox" / f"{flag(args, '--for')}.jsonl"
         rows = [json.loads(line) for line in read(box).splitlines() if line]
         shown = rows if "--all" in args and "--claim" not in args else [

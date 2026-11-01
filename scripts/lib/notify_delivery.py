@@ -351,6 +351,49 @@ def wake(sid: str, text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def mailbox(sid: str) -> tuple[list | None, str]:
+    """Peek including claimed records; absence is not an acknowledgement."""
+    try:
+        out = subprocess.run(
+            ["thurbox-cli", "message", "inbox", "--for", sid, "--all", "--json"],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        rows = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return None, f"inbox lookup failed: {exc}"
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        return None, "inbox lookup did not answer a list of records"
+    return rows, ""
+
+
+def enqueue(sid: str, text: str, kind: str) -> tuple[dict | None, str, bool]:
+    """Return the durable mailbox receipt, never treating exit zero alone as one."""
+    try:
+        child = subprocess.Popen(
+            ["thurbox-cli", "message", "send", "--to", sid, "--kind", kind,
+             "--body", text, "--no-wake", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        )
+    except OSError as exc:
+        return None, f"message send did not start: {exc}", False
+    try:
+        with child:
+            try:
+                stdout, _stderr = child.communicate(timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                child.kill()
+                child.communicate()
+                raise
+        receipt = json.loads(stdout) if child.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return None, f"message send result unknown: {exc}", True
+    if (not isinstance(receipt, dict) or receipt.get("enqueued") is not True
+            or type(receipt.get("message_id")) is not int or receipt["message_id"] <= 0
+            or receipt.get("to_session_id") != sid):
+        return None, "message send returned no matching receipt", True
+    return receipt, "", True
+
+
 def post(sid: str, text: str, kind: str = "fleet-ready") -> tuple[bool, str]:
     """Leave one line in a session's thurbox mailbox, and wake nothing.
 

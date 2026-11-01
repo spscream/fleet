@@ -106,12 +106,14 @@ def test_a_question_reaches_the_session_origin_once_and_not_the_conductor(stubs,
     session(stubs, "origin", "Somebody", SID, backend_type="local:tmux")
     notify(tmp_path, asking=asks(ref))
     assert to(stubs, "lead-id") == [], "the conductor was told a question its origin owns"
-    expect(to(stubs, SID)[0], ref, "which database?", f"fleet queue send {ref}")
+    expect(stubs.inbox(SID)[0]["body"], ref, "which database?", f"fleet queue send {ref}")
+    expect(to(stubs, SID)[0], "message inbox --claim")
+    assert run(["thurbox-cli", "message", "inbox", "--for", SID, "--claim", "--json"]).code == 0
     notify(tmp_path, asking=asks(ref))
     assert len(to(stubs, SID)) == 1, "the same question was asked twice"
     notify(tmp_path, asking=asks(ref, "and which schema?", "2026-10-13T11:00:00+00:00"))
     assert len(to(stubs, SID)) == 2, "a second question is news"
-    expect(to(stubs, SID)[1], "and which schema?")
+    expect(stubs.inbox(SID)[1]["body"], "and which schema?")
 
 
 def test_a_question_whose_session_origin_is_gone_is_told_to_nobody(stubs, tmp_path):

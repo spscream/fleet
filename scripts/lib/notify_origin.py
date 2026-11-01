@@ -35,9 +35,10 @@ was. Nothing falls back to a lead.
 Each decision is one `notice` line in `notify_delivery.notice`'s shape — kind
 `question` or `outcome` — which `collect`'s report and the loop's log carry.
 
-HOW is `notify_delivery.py`'s, the same as the conductor's: typed only into a
-session at rest whose input line is provably empty, else posted to its mailbox
-`--no-wake` once while the wake waits; a relay bounded and never raised.
+HOW uses `notify_delivery.py`'s rest and empty-composer guard. Session notices
+are enqueued silently, with their receipt saved before a wake. Only an inbox
+claim acknowledges receipt. Until then an idle session gets an instruction to
+claim its inbox, never a second copy of the payload. Relays stay bounded.
 
 EACH ONCE, with a memory of its own beside the reconciler's runtime state and
 never on a task — the reconciler writes no record. `origin_questions.json` is
@@ -59,9 +60,11 @@ Requires: python3; `thurbox-cli` to reach a session.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
+import uuid
 
 
 def _load_sibling(name: str, filename: str):
@@ -144,11 +147,29 @@ class Reach:
         return str(row.get("name") or target.value), row, ""
 
 
-def tell(reach: Reach, target, line: str, entry: dict, kind: str, subject: str) -> tuple[str, str]:
+    def recipient(self, target) -> tuple[str, str]:
+        if target.kind in ("session", "owner"):
+            _name, row, _why = self.row(target)
+            if row:
+                return "session", str(row["id"])
+        return target.kind, str(target.origin)
+
+
+def save(path: str, doc: dict) -> bool:
+    """Delivery requires durable identity; a failed write must stop the send."""
+    try:
+        fleetqueue.fleet_platform.write_record(path, json.dumps(doc))
+    except OSError:
+        return False
+    return True
+
+
+def tell(reach: Reach, target, line: str, entry: dict, kind: str, subject: str, persist=lambda: True) -> tuple[str, str]:
     """Deliver `line` to `target` once: ("sent" | "wait" | "dropped", its `notice` line).
 
     `entry` is this notice's memory and is updated in place: `posted` once its
-    mailbox note is left, `tries` for a relay that failed. `kind` is the
+    mailbox note is left, `message_id` and `mailbox_session` identify it,
+    `posting` guards ambiguous sends, and `tries` counts relay failures. `kind` is the
     mailbox kind, `fleet-<what the notice line calls it>`; `subject` is what
     the line is about.
     """
@@ -167,16 +188,58 @@ def tell(reach: Reach, target, line: str, entry: dict, kind: str, subject: str) 
     if row is None:
         return "wait", notice(said, name, None, "waiting", f"{subject}: {why}; it waits")
     sid = str(row["id"])
+    # Save intent BEFORE enqueue: after an ambiguous CLI failure or restart,
+    # recover this exact record rather than enqueueing another copy.
+    if not entry.get("posted") and not entry.get("posting"):
+        before = dict(entry)
+        entry.update(posting=True, mailbox_session=sid,
+                     mailbox_body=f"{line}\n[fleet-notice:{uuid.uuid4().hex}]")
+        if not persist():
+            entry.clear()
+            entry.update(before)
+            return "wait", notice(said, name, row, "waiting", f"{subject}: receipt memory is not writable")
+        receipt, why, started = delivery.enqueue(sid, entry["mailbox_body"], kind)
+        if not started:
+            entry.clear()
+            entry.update(before)
+            persist()
+            return "wait", notice(said, name, row, "waiting", f"{subject}: {why}; it is tried again")
+        if receipt:
+            entry.update(posted=True, message_id=receipt["message_id"])
+            if not persist():
+                return "wait", notice(said, name, row, "waiting", f"{subject}: receipt memory is not writable")
+    if entry.get("mailbox_session", sid) != sid:
+        return "wait", notice(said, name, row, "waiting", f"{subject}: mailbox recipient changed")
+    rows, why = delivery.mailbox(sid)
+    if rows is None:
+        return "wait", notice(said, name, row, "waiting", f"{subject}: {why}")
+    matches = [r for r in rows if r.get("to_session_id") == sid
+               and r.get("kind") == kind and r.get("body") == entry.get("mailbox_body", line)
+               and (not entry.get("message_id") or r.get("id") == entry["message_id"])]
+    if len(matches) != 1 or type(matches[0].get("id")) is not int:
+        return "wait", notice(said, name, row, "waiting",
+                              f"{subject}: mailbox identity unknown; retained for reconciliation")
+    message = matches[0]
+    entry.update(posted=True, message_id=message["id"], mailbox_session=sid)
+    if not persist():
+        return "wait", notice(said, name, row, "waiting", f"{subject}: receipt memory is not writable")
+    # read_at acknowledges a mailbox claim, never visual reading by a person.
+    read_at = message.get("read_at")
+    if type(read_at) is int and read_at > 0:
+        return "sent", notice(said, name, row, "claimed", subject)
+    if "read_at" not in message or read_at is not None:
+        return "wait", notice(said, name, row, "waiting", f"{subject}: unknown claim status")
     busy = delivery.held(name, row)
     if busy:
-        if not entry.get("posted"):
-            entry["posted"] = delivery.post(sid, line, kind=kind)[0]
-        how = "mailbox" if entry["posted"] else "waiting"
-        return "wait", notice(said, name, row, how, f"{subject}: {busy}; the wake waits")
-    sent, why = delivery.wake(sid, line)
+        return "wait", notice(said, name, row, "mailbox", f"{subject}: {busy}; the wake waits")
+    # Wake with an instruction, not a second copy of the stored payload. A
+    # successful terminal write is NOT an acknowledgement; retry until claimed.
+    prompt = ("fleet: pending mailbox notification. Read it with "
+              "thurbox-cli message inbox --claim --limit 1 --json")
+    sent, why = delivery.wake(sid, prompt)
     if not sent:
         return "wait", notice(said, name, row, "failed", f"{subject}: could not wake it: {why}")
-    return "sent", notice(said, name, row, "typed", subject)
+    return "wait", notice(said, name, row, "typed", f"{subject}: inbox wake; awaiting claim")
 
 
 def conductor_id(rules: list) -> str:
@@ -229,7 +292,7 @@ def questions(state_dir: str, rows: list, conductor: str = "") -> tuple[set, str
         return set(), ""
     rules = fleetqueue.origin_rules()
     reach = Reach(conductor or conductor_id(rules), held)
-    taken, notes = set(), []
+    taken, notes, waiting = set(), [], set()
     for row in sorted(rows, key=lambda r: str(r.get("task"))):
         ref = str(row.get("task"))
         task = tasks.get(ref)
@@ -237,14 +300,19 @@ def questions(state_dir: str, rows: list, conductor: str = "") -> tuple[set, str
         if target is None or target.kind == "unrouted":
             continue
         taken.add(ref)
-        note = ask(reach, target, row, asked)
+        recipient = reach.recipient(target)
+        if recipient in waiting:
+            continue
+        note = ask(reach, target, row, asked, lambda: save(path, {"asked": asked}))
+        if not asked.get(ref, {}).get("done"):
+            waiting.add(recipient)
         if note:
             notes.append(note)
     delivery.write_memory(path, {"asked": asked})
     return taken, "; ".join(notes)
 
 
-def ask(reach: Reach, target, row: dict, asked: dict) -> str:
+def ask(reach: Reach, target, row: dict, asked: dict, persist=lambda: True) -> str:
     """Put one worker's question to its origin, once per declaration: the note to log.
 
     `asked` is the questions memory, updated in place: an entry per ref, keyed
@@ -258,12 +326,15 @@ def ask(reach: Reach, target, row: dict, asked: dict) -> str:
     if entry.get("done"):
         return ""
     if target.kind == "gone":
+        if entry.get("posted") or entry.get("posting"):
+            return notice("question", str(target.origin), None, "waiting",
+                          f"{ref}: mailbox recipient unavailable; it waits")
         entry["done"] = True
         return notice("question", str(target.origin), None, "dropped",
                       f"{ref} needs input, but its origin is gone ({target.why}); "
                       "the question stays in its own pane")
     outcome, note = tell(reach, target, question_line(ref, row.get("why")), entry, "fleet-question",
-                         f"{ref} needs input")
+                         f"{ref} needs input", persist)
     if outcome != "wait":
         entry["done"] = True
     return note
@@ -310,7 +381,7 @@ def outcomes(events: list, state_dir: str | None = None) -> list[str]:
         with fleetqueue.fleet_platform.exclusive_lock(path + ".lock", wait=LOCK_WAIT_SECS):
             doc = delivery.read_memory(path)
             add(doc, events)
-            lines = flush(doc, keep=True)
+            lines = flush(doc, keep=True, persist=lambda: save(path, doc))
             delivery.write_memory(path, {"pending": doc["pending"], "sent": doc["sent"][-REMEMBERED:]})
             return lines
     except fleetqueue.fleet_platform.LockHeld:
@@ -333,20 +404,22 @@ def add(doc: dict, events: list) -> None:
     doc["pending"], doc["sent"] = pending, sent
 
 
-def deliver_outcome(reach: Reach, rules: list, key: str, entry: dict, keep: bool) -> tuple[str, str]:
+def deliver_outcome(reach: Reach, rules: list, key: str, entry: dict, keep: bool, persist=lambda: True) -> tuple[str, str]:
     """Tell one pending outcome to its origin: ("sent" | "wait" | "dropped", a log line)."""
     target = reach.target(entry.get("origin"), rules)
     if target is None or target.kind in ("gone", "unrouted"):
+        if entry.get("posted") or entry.get("posting"):
+            return "wait", notice("outcome", "", None, "waiting", f"{key}: recipient unavailable")
         why = target.why if target else "no origin"
         return "dropped", notice("outcome", str(entry.get("origin") or ""), None, "dropped",
                                  f"{key} told nobody — {why}")
-    outcome, note = tell(reach, target, str(entry.get("line")), entry, "fleet-outcome", key)
+    outcome, note = tell(reach, target, str(entry.get("line")), entry, "fleet-outcome", key, persist)
     if outcome == "wait" and not keep:
         note += ", but there is no runtime directory to keep it in, so it is dropped"
     return outcome, note
 
 
-def flush(doc: dict, keep: bool) -> list[str]:
+def flush(doc: dict, keep: bool, persist=lambda: True) -> list[str]:
     """Deliver every pending outcome, in the order they happened."""
     pending = doc["pending"]
     if not pending:
@@ -354,9 +427,15 @@ def flush(doc: dict, keep: bool) -> list[str]:
     _tasks, held = tasks_and_holders()
     rules = fleetqueue.origin_rules()
     reach = Reach(conductor_id(rules), held)
-    lines = []
+    lines, waiting = [], set()
     for key in sorted(pending, key=lambda k: (pending[k].get("at") or 0, k)):
-        outcome, line = deliver_outcome(reach, rules, key, pending[key], keep)
+        target = reach.target(pending[key].get("origin"), rules)
+        recipient = reach.recipient(target) if target else ("", "")
+        if keep and recipient in waiting:
+            continue
+        outcome, line = deliver_outcome(reach, rules, key, pending[key], keep, persist)
+        if outcome == "wait":
+            waiting.add(recipient)
         lines.append(line)
         if outcome == "sent":
             doc["sent"].append(key)

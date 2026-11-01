@@ -21,7 +21,7 @@ import pytest
 import yaml
 from queuekit import ok, result, result_artifacts
 
-from harness import expect, refute, write
+from harness import expect, refute, run, write
 from harness import run_queue as q
 
 PR = "https://github.com/Thurbeen/thurbox/pull/"
@@ -98,11 +98,14 @@ def test_the_origin_is_told_it_landed_once(queue_dir, stubs):
     ok(q("collect"))
     stubs.pr_state(53, "MERGED")
     ok(q("collect"))
+    expect(stubs.inbox(SID)[0]["body"], f"fleet: {ref} landed", f"{PR}53")
+    assert run(["thurbox-cli", "message", "inbox", "--for", SID, "--claim", "--json"]).code == 0
     ok(q("collect"))
     ok(q("reap"))
     told = [c for c in stubs.calls("thurbox-cli", "session send") if c.split()[3] == SID]
     assert len(told) == 1, told
-    expect(told[0], f"fleet: {ref} landed", f"{PR}53")
+    expect(told[0], "message inbox --claim")
+    assert stubs.inbox(SID)[0]["body"] not in told[0]
 
 
 @pytest.mark.parametrize("state", ["OPEN", "CLOSED"])
