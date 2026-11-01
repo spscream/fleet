@@ -386,3 +386,68 @@ def test_unknown_enqueue_beyond_default_page_recovers_without_repeat(stubs, tmp_
     assert done()
     assert wakes(stubs) == []
     assert len(stubs.calls("thurbox-cli", "message send")) == 1
+
+
+def codex_shortcuts_pane(stubs, **changes):
+    # The observed empty pane has a 154-column footer, with warnings aligned
+    # to the right of the shortcut hint. Keep geometry, use synthetic text.
+    rows = [""] * 35 + ["› Ask Codex to do anything", "",
+                            "model · ~/example · Context 50% used · Ready",
+                            "  ? for shortcuts" + " " * 110 + "⚠ 5 warnings · f2 to view", ""]
+    if changes.get("below"):
+        rows[36] = "second draft line"
+    if changes.get("unknown"):
+        rows[38] += " · unknown hint"
+    plain = {"output": "\n".join(row.ljust(154) for row in rows),
+             "cursor_row": 35, "cursor_col": changes.get("cursor", 2)}
+    styled_rows = rows.copy()
+    style = changes.get("style", "\x1b[2m")
+    styled_rows[35] = "\x1b[1m›\x1b[0m " + style + rows[35][2:] + "\x1b[0m"
+    if changes.get("mismatch"):
+        styled_rows[36] = "draft appeared between captures"
+    styled = {**plain, "output": "\n".join(row.ljust(154) for row in styled_rows)}
+    for suffix, pane in (("", plain), (".ansi", styled)):
+        write(stubs.root / f"panes/{SID}{suffix}.json", json.dumps(pane))
+
+
+@pytest.mark.parametrize("route", ["outcome", "question"])
+def test_codex_shortcuts_warning_footer_wakes_pending_receipt(stubs, tmp_path, route):
+    tick, entry, done = delivery_route(stubs, tmp_path, route)
+    tick()
+    before = dict(entry())
+    session(stubs, "origin", "Recipient", SID, state="done")
+    codex_shortcuts_pane(stubs)
+    tick()
+    assert len(wakes(stubs)) == 1
+    assert "message inbox --claim --limit 1 --json" in wakes(stubs)[0]
+    assert inbox(stubs)[0]["body"] not in wakes(stubs)[0]
+    assert entry() == before
+    assert not done(), "a wake cannot acknowledge the receipt"
+    claim()
+    tick()
+    assert done()
+    assert len(inbox(stubs)) == 1
+    assert len(stubs.calls("thurbox-cli", "message send")) == 1
+    assert len(wakes(stubs)) == 1
+
+
+@pytest.mark.parametrize("route", ["outcome", "question"])
+@pytest.mark.parametrize("changes", [
+    {"style": ""}, {"style": "\x1b[38;2;2;2;2m"}, {"below": True},
+    {"unknown": True}, {"mismatch": True}, {"cursor": None},
+    {"cursor": 3}, {"state": "working"}, {"state": "blocked"},
+    {"state": "unknown"},
+], ids=["draft", "truecolor-draft", "multiline", "unknown-footer", "changed-capture",
+        "missing-cursor", "moved-cursor", "busy", "blocked", "unknown-state"])
+def test_codex_warning_footer_keeps_unsafe_wakes_pending(stubs, tmp_path, route, changes):
+    tick, entry, done = delivery_route(stubs, tmp_path, route)
+    tick()
+    before = dict(entry())
+    session(stubs, "origin", "Recipient", SID, state=changes.get("state", "done"))
+    codex_shortcuts_pane(stubs, **changes)
+    tick()
+    assert wakes(stubs) == []
+    assert entry() == before
+    assert not done()
+    assert len(inbox(stubs)) == 1
+    assert len(stubs.calls("thurbox-cli", "message send")) == 1

@@ -257,7 +257,7 @@ def composer_empty(sid: str) -> bool:
 
 _CODEX_HINT = re.compile(
     r'(?:New activity · Earlier messages available\.  enter/esc latest · )?'
-    r'\? shortcuts(?:\s+⚠ \d+ warnings? · f2 to view)?|\? for shortcuts'
+    r'\? (?:for )?shortcuts(?:\s+⚠ \d+ warnings? · f2 to view)?'
 )
 
 
